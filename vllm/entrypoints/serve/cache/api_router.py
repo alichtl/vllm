@@ -3,7 +3,8 @@
 
 
 from fastapi import APIRouter, FastAPI, Query, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
 
 import vllm.envs as envs
 from vllm.engine.protocol import EngineClient
@@ -66,7 +67,71 @@ async def reset_encoder_cache(raw_request: Request):
     return Response(status_code=200)
 
 
+class SnapshotRequest(BaseModel):
+    request_id: str
+    snapshot_id: str | None = None
+
+
+class RestoreRequest(BaseModel):
+    snapshot_id: str
+
+
+# KV snapshot router — always attached (production-available)
+kv_router = APIRouter(prefix="/kv", tags=["kv-snapshot"])
+
+
+@kv_router.post("/snapshot")
+async def snapshot_kv_cache(body: SnapshotRequest, raw_request: Request):
+    """Snapshot the KV cache for a request."""
+    try:
+        result = await engine_client(raw_request).snapshot_kv_cache(
+            body.request_id, body.snapshot_id
+        )
+        return JSONResponse(content=result)
+    except ValueError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+    except RuntimeError as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+
+
+@kv_router.post("/restore")
+async def restore_kv_cache(body: RestoreRequest, raw_request: Request):
+    """Restore a KV cache snapshot."""
+    try:
+        result = await engine_client(raw_request).restore_kv_cache(
+            body.snapshot_id
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+    if result is None:
+        return JSONResponse(status_code=404,
+                            content={"error": "snapshot not found"})
+    return JSONResponse(content=result)
+
+
+@kv_router.delete("/{snapshot_id}")
+async def delete_kv_snapshot(snapshot_id: str, raw_request: Request):
+    """Delete a KV cache snapshot."""
+    result = await engine_client(raw_request).delete_kv_snapshot(snapshot_id)
+    return JSONResponse(content=result)
+
+
+@kv_router.get("/{snapshot_id}/status")
+async def get_kv_snapshot_status(snapshot_id: str, raw_request: Request):
+    """Get the status of a KV cache snapshot."""
+    result = await engine_client(raw_request).get_kv_snapshot_status(
+        snapshot_id
+    )
+    if result is None:
+        return JSONResponse(status_code=404,
+                            content={"error": "snapshot not found"})
+    return JSONResponse(content=result)
+
+
 def attach_router(app: FastAPI):
+    # KV snapshot endpoints are always available (production-ready)
+    app.include_router(kv_router)
+    # Dev-mode cache management endpoints
     if not envs.VLLM_SERVER_DEV_MODE:
         return
     app.include_router(router)
