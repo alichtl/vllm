@@ -148,6 +148,28 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def snapshot_kv_cache(
+        self, request_id: str, snapshot_id: str | None = None
+    ) -> dict:
+        """Snapshot the KV cache for a request."""
+        ...
+
+    @abstractmethod
+    async def restore_kv_cache(self, snapshot_id: str) -> dict:
+        """Restore a KV cache snapshot."""
+        ...
+
+    @abstractmethod
+    async def delete_kv_snapshot(self, snapshot_id: str) -> dict:
+        """Delete a KV cache snapshot."""
+        ...
+
+    @abstractmethod
+    async def get_kv_snapshot_status(self, snapshot_id: str) -> dict | None:
+        """Get the status of a KV cache snapshot."""
+        ...
+
+    @abstractmethod
     async def sleep(self, level: int = 1, mode: "PauseMode" = "abort") -> None:
         """Sleep the engine"""
         ...
