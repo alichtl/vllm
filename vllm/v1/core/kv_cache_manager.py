@@ -550,3 +550,77 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
         self.coordinator.new_step_starts()
+
+
+# ---------------------------------------------------------------------------
+# Standalone snapshot serialization helpers (no GPU / no class instance needed)
+# ---------------------------------------------------------------------------
+
+def create_snapshot_from_blocks(
+    snapshot_id: str,
+    request_id: str,
+    block_ids: list[int],
+    block_data: dict[int, "torch.Tensor"],
+    block_hashes: dict[int, bytes | None],
+    num_tokens: int,
+    block_size: int,
+    dtype: "torch.dtype",
+    num_kv_heads: int,
+    head_size: int,
+    num_layers: int,
+) -> "KVCacheSnapshot":
+    """Build a KVCacheSnapshot from pre-read GPU block tensors.
+
+    All tensors are cloned to CPU so the snapshot is independent of GPU
+    memory.  ``block_data[block_id]`` should have shape
+    ``[2, num_layers, block_size, num_kv_heads, head_size]``.
+    """
+    import torch
+
+    from vllm.v1.core.kv_cache_snapshot import (
+        KVCacheSnapshot,
+        SnapshotBlockData,
+        SnapshotMetadata,
+    )
+
+    metadata = SnapshotMetadata(
+        snapshot_id=snapshot_id,
+        request_id=request_id,
+        num_tokens=num_tokens,
+        num_blocks=len(block_ids),
+        block_size=block_size,
+        dtype=dtype,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        num_layers=num_layers,
+    )
+    blocks = []
+    for bid in block_ids:
+        tensor = block_data[bid]
+        cpu_tensor = tensor.detach().cpu().clone() if tensor.device.type != "cpu" else tensor.clone()
+        blocks.append(SnapshotBlockData(
+            block_id=bid,
+            block_hash=block_hashes.get(bid),
+            data=cpu_tensor,
+        ))
+    return KVCacheSnapshot(metadata=metadata, blocks=blocks)
+
+
+def prepare_restore_data(
+    snapshot: "KVCacheSnapshot",
+    new_block_ids: list[int],
+) -> dict[int, "torch.Tensor"]:
+    """Map freshly allocated block IDs to the snapshot's CPU tensors.
+
+    ``new_block_ids`` must have the same length as ``snapshot.blocks``.
+    Returns ``{new_block_id: cpu_tensor}``.
+    """
+    if len(new_block_ids) != len(snapshot.blocks):
+        raise ValueError(
+            f"Block count mismatch: {len(new_block_ids)} new IDs vs "
+            f"{len(snapshot.blocks)} snapshot blocks"
+        )
+    return {
+        new_id: block.data
+        for new_id, block in zip(new_block_ids, snapshot.blocks)
+    }
