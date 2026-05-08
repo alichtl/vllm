@@ -155,8 +155,8 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
-    async def restore_kv_cache(self, snapshot_id: str) -> dict:
-        """Restore a KV cache snapshot."""
+    async def restore_kv_cache(self, snapshot_id: str) -> dict | None:
+        """Restore a KV cache snapshot. Returns None if not found."""
         ...
 
     @abstractmethod

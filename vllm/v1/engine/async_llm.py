@@ -902,6 +902,24 @@ class AsyncLLM(EngineClient):
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
+    async def snapshot_kv_cache(
+        self, request_id: str, snapshot_id: str | None = None
+    ) -> dict:
+        return await self.engine_core.snapshot_kv_cache_async(
+            request_id, snapshot_id
+        )
+
+    async def restore_kv_cache(self, snapshot_id: str) -> dict | None:
+        return await self.engine_core.restore_kv_cache_async(snapshot_id)
+
+    async def delete_kv_snapshot(self, snapshot_id: str) -> dict:
+        return await self.engine_core.delete_kv_snapshot_async(snapshot_id)
+
+    async def get_kv_snapshot_status(
+        self, snapshot_id: str
+    ) -> dict | None:
+        return await self.engine_core.get_kv_snapshot_status_async(snapshot_id)
+
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.engine_core.sleep_async(level, mode)
 
