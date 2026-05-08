@@ -162,6 +162,24 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    kv_snapshot_enabled: bool = False
+    """Enable the /kv/* snapshot/restore HTTP API. When True, the engine
+    initializes a tiered (host RAM + disk) snapshot store and accepts
+    snapshot/restore RPCs. Disabled by default; the HTTP routes still mount
+    but every call fails fast."""
+
+    kv_snapshot_dir: str = "/var/cache/vllm/kv"
+    """Directory for the cold (disk) tier of the snapshot store. Created
+    on first use. Only meaningful when ``kv_snapshot_enabled`` is True."""
+
+    kv_snapshot_warm_max_bytes: int = 8 * 1024 * 1024 * 1024
+    """Soft cap on bytes held in the warm (host RAM) tier before the oldest
+    snapshots spill to disk. Defaults to 8 GiB."""
+
+    kv_snapshot_ttl_seconds: int = 86400
+    """Time-to-live for snapshots in seconds. Snapshots older than this are
+    eligible for cleanup. Defaults to 24 hours."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -191,6 +209,11 @@ class CacheConfig:
             "num_cpu_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            # KV snapshot is a runtime serialization knob; no graph impact
+            "kv_snapshot_enabled",
+            "kv_snapshot_dir",
+            "kv_snapshot_warm_max_bytes",
+            "kv_snapshot_ttl_seconds",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
