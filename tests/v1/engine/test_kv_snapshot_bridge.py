@@ -210,8 +210,10 @@ def test_worker_read_kv_blocks_returns_dict_keyed_by_id():
     out = Worker.read_kv_blocks(stub, block_ids=[3, 7])
 
     assert set(out.keys()) == {3, 7}
-    assert out[3].item() == 3.0
-    assert out[7].item() == 7.0
+    # Each entry is the per-block tensor returned by read_kv_block; the stub
+    # fills it with the block_id value so we can identify the mapping.
+    torch.testing.assert_close(out[3], torch.full((2, 1, 1, 1, 1), 3.0))
+    torch.testing.assert_close(out[7], torch.full((2, 1, 1, 1, 1), 7.0))
 
 
 def test_cache_config_kv_snapshot_defaults():
