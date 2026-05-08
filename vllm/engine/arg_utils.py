@@ -625,6 +625,12 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+
+    kv_snapshot_enabled: bool = CacheConfig.kv_snapshot_enabled
+    kv_snapshot_dir: str = CacheConfig.kv_snapshot_dir
+    kv_snapshot_warm_max_bytes: int = CacheConfig.kv_snapshot_warm_max_bytes
+    kv_snapshot_ttl_seconds: int = CacheConfig.kv_snapshot_ttl_seconds
+
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1029,6 +1035,20 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+        cache_group.add_argument(
+            "--kv-snapshot-enabled", **cache_kwargs["kv_snapshot_enabled"]
+        )
+        cache_group.add_argument(
+            "--kv-snapshot-dir", **cache_kwargs["kv_snapshot_dir"]
+        )
+        cache_group.add_argument(
+            "--kv-snapshot-warm-max-bytes",
+            **cache_kwargs["kv_snapshot_warm_max_bytes"],
+        )
+        cache_group.add_argument(
+            "--kv-snapshot-ttl-seconds",
+            **cache_kwargs["kv_snapshot_ttl_seconds"],
         )
 
         # Model weight offload related configs
@@ -1592,6 +1612,10 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            kv_snapshot_enabled=self.kv_snapshot_enabled,
+            kv_snapshot_dir=self.kv_snapshot_dir,
+            kv_snapshot_warm_max_bytes=self.kv_snapshot_warm_max_bytes,
+            kv_snapshot_ttl_seconds=self.kv_snapshot_ttl_seconds,
         )
 
         ray_runtime_env = None
