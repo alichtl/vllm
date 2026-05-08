@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 import vllm.envs as envs
 from vllm.engine.protocol import EngineClient
+from vllm.kv_snapshot.config import SnapshotConfig
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -17,6 +18,46 @@ router = APIRouter()
 
 def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
+
+
+def kv_snapshot_config(request: Request) -> SnapshotConfig:
+    """Return the snapshot config attached to the app, or a fresh from-env one."""
+    return getattr(request.app.state, "kv_snapshot_config", SnapshotConfig.from_env())
+
+
+def _reject_prefix(
+    snapshot_id: str | None,
+    allowed: tuple[str, ...],
+) -> JSONResponse | None:
+    """If enforcement is on, reject ids that don't carry an allowed prefix.
+
+    Returns a 403 JSONResponse on rejection, or None to allow the request through.
+    snapshot_id=None on POST /kv/snapshot is rejected when enforcement is on
+    (callers must supply their own prefixed id; the server will not auto-generate).
+    """
+    if not allowed:
+        return None
+    if snapshot_id is None:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error":
+                "snapshot_id is required when "
+                "VLLM_KV_SNAPSHOT_ALLOWED_PREFIXES is set",
+                "allowed_prefixes": list(allowed),
+            },
+        )
+    if not any(snapshot_id.startswith(p) for p in allowed):
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error":
+                f"snapshot_id {snapshot_id!r} does not start with an "
+                "allowed prefix",
+                "allowed_prefixes": list(allowed),
+            },
+        )
+    return None
 
 
 @router.post("/reset_prefix_cache")
@@ -83,6 +124,10 @@ kv_router = APIRouter(prefix="/kv", tags=["kv-snapshot"])
 @kv_router.post("/snapshot")
 async def snapshot_kv_cache(body: SnapshotRequest, raw_request: Request):
     """Snapshot the KV cache for a request."""
+    config = kv_snapshot_config(raw_request)
+    rejection = _reject_prefix(body.snapshot_id, config.allowed_id_prefixes)
+    if rejection is not None:
+        return rejection
     try:
         result = await engine_client(raw_request).snapshot_kv_cache(
             body.request_id, body.snapshot_id
@@ -97,6 +142,10 @@ async def snapshot_kv_cache(body: SnapshotRequest, raw_request: Request):
 @kv_router.post("/restore")
 async def restore_kv_cache(body: RestoreRequest, raw_request: Request):
     """Restore a KV cache snapshot."""
+    config = kv_snapshot_config(raw_request)
+    rejection = _reject_prefix(body.snapshot_id, config.allowed_id_prefixes)
+    if rejection is not None:
+        return rejection
     try:
         result = await engine_client(raw_request).restore_kv_cache(
             body.snapshot_id
@@ -112,6 +161,10 @@ async def restore_kv_cache(body: RestoreRequest, raw_request: Request):
 @kv_router.delete("/{snapshot_id}")
 async def delete_kv_snapshot(snapshot_id: str, raw_request: Request):
     """Delete a KV cache snapshot."""
+    config = kv_snapshot_config(raw_request)
+    rejection = _reject_prefix(snapshot_id, config.allowed_id_prefixes)
+    if rejection is not None:
+        return rejection
     result = await engine_client(raw_request).delete_kv_snapshot(snapshot_id)
     return JSONResponse(content=result)
 
@@ -119,6 +172,10 @@ async def delete_kv_snapshot(snapshot_id: str, raw_request: Request):
 @kv_router.get("/{snapshot_id}/status")
 async def get_kv_snapshot_status(snapshot_id: str, raw_request: Request):
     """Get the status of a KV cache snapshot."""
+    config = kv_snapshot_config(raw_request)
+    rejection = _reject_prefix(snapshot_id, config.allowed_id_prefixes)
+    if rejection is not None:
+        return rejection
     result = await engine_client(raw_request).get_kv_snapshot_status(
         snapshot_id
     )
@@ -129,7 +186,11 @@ async def get_kv_snapshot_status(snapshot_id: str, raw_request: Request):
 
 
 def attach_router(app: FastAPI):
-    # KV snapshot endpoints are always available (production-ready)
+    # KV snapshot endpoints are always available (production-ready).
+    # Attach a from-env SnapshotConfig if the embedder didn't set one,
+    # so VLLM_KV_SNAPSHOT_ALLOWED_PREFIXES takes effect without code changes.
+    if not hasattr(app.state, "kv_snapshot_config"):
+        app.state.kv_snapshot_config = SnapshotConfig.from_env()
     app.include_router(kv_router)
     # Dev-mode cache management endpoints
     if not envs.VLLM_SERVER_DEV_MODE:

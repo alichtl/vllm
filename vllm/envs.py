@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     K_SCALE_CONSTANT: int = 200
     V_SCALE_CONSTANT: int = 100
     VLLM_SERVER_DEV_MODE: bool = False
+    VLLM_KV_SNAPSHOT_ALLOWED_PREFIXES: str = ""
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
@@ -1062,6 +1063,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
     "VLLM_SERVER_DEV_MODE": lambda: bool(int(os.getenv("VLLM_SERVER_DEV_MODE", "0"))),
+    # Comma-separated list of allowed snapshot_id prefixes for the
+    # /kv/* API. When non-empty, every snapshot/restore/delete/status
+    # request must reference an id starting with one of these prefixes,
+    # and POST /kv/snapshot must supply an explicit snapshot_id. Empty
+    # disables enforcement. Use to keep multiple callers of the same
+    # vLLM server from colliding on the flat snapshot keyspace.
+    "VLLM_KV_SNAPSHOT_ALLOWED_PREFIXES":
+    lambda: os.getenv("VLLM_KV_SNAPSHOT_ALLOWED_PREFIXES", ""),
     # Controls the maximum number of requests to handle in a
     # single asyncio task when processing per-token outputs in the
     # V1 AsyncLLM interface. It is applicable when handling a high
