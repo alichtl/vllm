@@ -888,6 +888,72 @@ class GPUModelRunner(
         self.late_interaction_runner.clear()
 
     @torch.inference_mode()
+    def read_kv_block(self, block_id: int) -> torch.Tensor:
+        """Copy one KV cache block out of GPU memory across all attention layers.
+
+        Assumes the per-layer cache shape is
+        ``(2, num_blocks, block_size, num_kv_heads, head_size)`` — the
+        FlashAttention-style logical layout produced by ``get_kv_cache_shape``.
+        Other backends (MLA / sparse) may need a separate path.
+
+        Returns a CPU tensor with shape
+        ``(2, num_layers, block_size, num_kv_heads_local, head_size)``,
+        where ``num_kv_heads_local`` is this TP rank's slice of KV heads.
+        Caller is responsible for gathering across ranks.
+        """
+        if not self.kv_caches:
+            raise RuntimeError("KV caches are not initialized")
+        layer_blocks: list[torch.Tensor] = []
+        for cache in self.kv_caches:
+            if cache.dim() != 5 or cache.shape[0] != 2:
+                raise RuntimeError(
+                    "read_kv_block expects per-layer cache shape "
+                    "(2, num_blocks, block_size, num_kv_heads, head_size); "
+                    f"got {tuple(cache.shape)}"
+                )
+            if not 0 <= block_id < cache.shape[1]:
+                raise IndexError(
+                    f"block_id {block_id} out of range for cache with "
+                    f"{cache.shape[1]} blocks"
+                )
+            # cache[:, block_id] → (2, block_size, num_kv_heads, head_size)
+            layer_blocks.append(cache[:, block_id].detach().to("cpu").clone())
+        # Stack on a new layer dim → (2, num_layers, block_size, kv_heads, head_size)
+        return torch.stack(layer_blocks, dim=1).contiguous()
+
+    @torch.inference_mode()
+    def write_kv_block(self, block_id: int, data: torch.Tensor) -> None:
+        """Copy a CPU snapshot block back into GPU memory across all layers.
+
+        ``data`` must have shape
+        ``(2, num_layers, block_size, num_kv_heads_local, head_size)`` and
+        should already match this rank's KV head slice (caller scatters).
+        """
+        if not self.kv_caches:
+            raise RuntimeError("KV caches are not initialized")
+        if data.dim() != 5 or data.shape[0] != 2:
+            raise ValueError(
+                "write_kv_block expects data shape "
+                "(2, num_layers, block_size, num_kv_heads, head_size); "
+                f"got {tuple(data.shape)}"
+            )
+        if data.shape[1] != len(self.kv_caches):
+            raise ValueError(
+                f"data has {data.shape[1]} layers but model has "
+                f"{len(self.kv_caches)} KV-cached layers"
+            )
+        for layer_idx, cache in enumerate(self.kv_caches):
+            if not 0 <= block_id < cache.shape[1]:
+                raise IndexError(
+                    f"block_id {block_id} out of range for cache with "
+                    f"{cache.shape[1]} blocks"
+                )
+            src = data[:, layer_idx].to(
+                cache.device, dtype=cache.dtype, non_blocking=True
+            )
+            cache[:, block_id].copy_(src)
+
+    @torch.inference_mode()
     def init_fp8_kv_scales(self) -> None:
         """
         Re-initialize the KV cache and FP8 scales after waking from sleep.
