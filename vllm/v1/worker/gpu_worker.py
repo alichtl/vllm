@@ -697,6 +697,42 @@ class Worker(WorkerBase):
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 
+    def read_kv_blocks(self, block_ids: list[int]) -> dict[int, torch.Tensor]:
+        """Read each block out of GPU memory; return CPU tensors keyed by id.
+
+        Returned tensors are this rank's KV-head slice; EngineCore concatenates
+        across ranks along the kv_heads dim.
+        """
+        return {
+            block_id: self.model_runner.read_kv_block(block_id)
+            for block_id in block_ids
+        }
+
+    def write_kv_blocks(
+        self,
+        block_ids: list[int],
+        shards_per_rank: list[list[torch.Tensor]],
+    ) -> None:
+        """Write a pre-sharded list of CPU block tensors back to GPU memory.
+
+        ``shards_per_rank[rank][i]`` is the tensor slice that should land in
+        ``block_ids[i]`` on the worker whose TP rank is ``rank``. Each worker
+        picks its own shard list using ``self.rank``.
+        """
+        if self.rank >= len(shards_per_rank):
+            raise RuntimeError(
+                f"shards_per_rank has {len(shards_per_rank)} entries, "
+                f"this worker is rank {self.rank}"
+            )
+        my_shards = shards_per_rank[self.rank]
+        if len(my_shards) != len(block_ids):
+            raise ValueError(
+                f"shards count ({len(my_shards)}) != block_ids count "
+                f"({len(block_ids)}) for rank {self.rank}"
+            )
+        for block_id, shard in zip(block_ids, my_shards):
+            self.model_runner.write_kv_block(block_id, shard)
+
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
