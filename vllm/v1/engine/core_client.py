@@ -269,6 +269,22 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
+    async def snapshot_kv_cache_async(
+        self, request_id: str, snapshot_id: str | None = None
+    ) -> dict:
+        raise NotImplementedError
+
+    async def restore_kv_cache_async(self, snapshot_id: str) -> dict | None:
+        raise NotImplementedError
+
+    async def delete_kv_snapshot_async(self, snapshot_id: str) -> dict:
+        raise NotImplementedError
+
+    async def get_kv_snapshot_status_async(
+        self, snapshot_id: str
+    ) -> dict | None:
+        raise NotImplementedError
+
 
 class InprocClient(EngineCoreClient):
     """
@@ -1103,6 +1119,28 @@ class AsyncMPClient(MPClient):
     ) -> list[_R]:
         return await self.call_utility_async(
             "collective_rpc", method, timeout, args, kwargs
+        )
+
+    async def snapshot_kv_cache_async(
+        self, request_id: str, snapshot_id: str | None = None
+    ) -> dict:
+        return await self.call_utility_async(
+            "snapshot_kv_cache", request_id, snapshot_id
+        )
+
+    async def restore_kv_cache_async(self, snapshot_id: str) -> dict | None:
+        return await self.call_utility_async("restore_kv_cache", snapshot_id)
+
+    async def delete_kv_snapshot_async(self, snapshot_id: str) -> dict:
+        return await self.call_utility_async(
+            "delete_kv_snapshot", snapshot_id
+        )
+
+    async def get_kv_snapshot_status_async(
+        self, snapshot_id: str
+    ) -> dict | None:
+        return await self.call_utility_async(
+            "get_kv_snapshot_status", snapshot_id
         )
 
 

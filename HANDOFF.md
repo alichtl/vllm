@@ -39,71 +39,56 @@ Tests cover everything above:
 - `tests/entrypoints/serve/cache/test_kv_snapshot_api.py` (rejection
   layer added in `a6ce1b721`)
 
-## What's NOT implemented (the load-bearing gap)
+## Engine bridge — landed (single-GPU and TP)
 
-**No engine implementation** of the four abstract methods declared in
-`vllm/engine/protocol.py:151-168`:
+The four abstract methods declared in `vllm/engine/protocol.py:151-170`
+now have a working implementation across the engine-core IPC boundary,
+including TP-aware gather/scatter:
 
-- `EngineClient.snapshot_kv_cache(request_id, snapshot_id)`
-- `EngineClient.restore_kv_cache(snapshot_id)`
-- `EngineClient.delete_kv_snapshot(snapshot_id)`
-- `EngineClient.get_kv_snapshot_status(snapshot_id)`
+- HTTP layer → `AsyncLLM.{snapshot,restore,delete,get_kv_snapshot_status}`
+  in `vllm/v1/engine/async_llm.py`
+- AsyncLLM → `EngineCoreClient.*_async` (`call_utility_async` on
+  `AsyncMPClient`) in `vllm/v1/engine/core_client.py`
+- EngineCore methods (`snapshot_kv_cache`, `restore_kv_cache`,
+  `delete_kv_snapshot`, `get_kv_snapshot_status`) in
+  `vllm/v1/engine/core.py`
+- TP gather/scatter via `model_executor.collective_rpc`:
+  - **Snapshot path** — each rank reads its KV-head slice via
+    `Worker.read_kv_blocks` → `GPUModelRunner.read_kv_block`, returns
+    `dict[block_id, Tensor]` on CPU. EngineCore concatenates per-block
+    along dim 3 (kv_heads) to produce the full-head snapshot.
+  - **Restore path** — EngineCore `torch.chunk`s each block tensor on
+    dim 3 into `tp_size` shards, broadcasts the shard list via
+    `collective_rpc("write_kv_blocks", ...)`. Each worker picks
+    `shards_per_rank[self.rank]` and writes via
+    `GPUModelRunner.write_kv_block`.
+- New CLI flags / `CacheConfig` fields wired through `arg_utils.py`:
+  `--kv-snapshot-enabled`, `--kv-snapshot-dir`,
+  `--kv-snapshot-warm-max-bytes`, `--kv-snapshot-ttl-seconds`. All
+  excluded from `compute_hash` so they don't invalidate compile caches.
+- Unit tests in `tests/v1/engine/test_kv_snapshot_bridge.py` cover the
+  TP cat/chunk math, the read/write_kv_block round-trip on a CPU stub,
+  and the worker-level rank dispatch.
 
-`AsyncLLM`, `LLMEngine`, `MQLLMEngine`, and friends in `vllm/v1/engine/`
-do not override these. **Calling any `/kv/*` endpoint today will
-`NotImplementedError` (or `AttributeError`) at runtime.**
+### What still needs follow-up
 
-This is the missing piece that everything downstream depends on. The
-HTTP layer, the prefix rejection, and any future auto-swap middleware
-all sit on top of these methods doing real work.
-
-## Implementing the engine layer (next session's main job)
-
-The engine implementation needs to bridge the API layer to the v1 core:
-
-1. **Snapshot path** (`AsyncLLM.snapshot_kv_cache`):
-   - Look up the request in `Scheduler` to get its allocated block list.
-   - Read the K/V tensors for those blocks out of the GPU `BlockPool`.
-   - Call `create_snapshot_from_blocks(...)` (already implemented in
-     `kv_cache_manager.py`) to materialize a `KVCacheSnapshot` with
-     CPU-cloned tensors.
-   - Hand it to a `SnapshotStore` backend (memory/disk/tiered) keyed by
-     `snapshot_id`.
-
-2. **Restore path** (`AsyncLLM.restore_kv_cache`):
-   - Load the snapshot from the store.
-   - Allocate fresh blocks in the `BlockPool` matching the snapshot's
-     block layout.
-   - Copy CPU tensors back into the new GPU blocks.
-   - Wire the new block ids into a request slot so the next prefill
-     step finds the prefilled state.
-
-3. **Engine boundary considerations**:
-   - The v1 scheduler runs in the engine-core process; the API runs in
-     the front-end process. Snapshot/restore needs to round-trip across
-     the IPC boundary (`core_client.py`). Use the same RPC pattern as
-     existing engine-core calls.
-   - Concurrency: snapshot/restore must respect in-flight steps. Probably
-     easiest to schedule them as engine-core tasks that run between
-     `step()` calls rather than concurrently.
-   - `BlockPool` allocations under restore can fail (OOM); the restore
-     RPC needs a typed error path.
-
-4. **Multi-GPU / TP**:
-   - Each TP rank holds a slice of every block. Snapshot must gather
-     across ranks; restore must scatter back. Use the existing
-     all-gather paths used by the model executor.
-
-5. **Tests**:
-   - Unit-test the engine path with a tiny model (the existing test
-     pattern in `tests/v1/engine/`).
-   - End-to-end test that snapshots a request mid-conversation, kills
-     the request, restores into a new one, and asserts the next decode
-     produces identical token logits.
-
-This is genuinely multi-session work. Plan to write it in pieces:
-serialize-block-tensors → restore-into-fresh-blocks → IPC bridge →
-TP-aware gather/scatter → tests.
+1. **Wire restored blocks to a request slot.** Today
+   `EngineCore.restore_kv_cache` allocates blocks (ref_cnt += 1) and
+   stashes them in `self._restored_block_holds[snapshot_id]`. The next
+   prefill won't pick them up automatically — either we register the
+   per-block hashes in the prefix cache, or we extend `restore` to take
+   a `request_id` and overwrite that request's blocks.
+2. **KV layout coverage.** Snapshot/restore assumes the FlashAttention
+   logical shape `(2, num_blocks, block_size, num_kv_heads, head_size)`
+   per layer. MLA / sparse / mamba layouts will need separate
+   implementations in `read_kv_block` / `write_kv_block`.
+3. **Multi-group caches.** The current code asserts a single
+   `kv_cache_group`. Models with sliding-window + full attention split
+   across groups need group-aware snapshot/restore.
+4. **Real-model end-to-end test.** The unit tests don't actually run a
+   model. A GPU-gated test that snapshots a mid-conversation request,
+   restores it, and asserts identical next-token logits is the
+   confidence-builder before relying on this in production.
 
 ## Auto-swap on tenant change (future, depends on the above)
 
