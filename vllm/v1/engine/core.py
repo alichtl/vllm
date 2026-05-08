@@ -603,6 +603,233 @@ class EngineCore:
         self.reset_mm_cache()
         self.reset_encoder_cache()
 
+    # ------------------------------------------------------------------
+    # KV cache snapshot / restore
+    # ------------------------------------------------------------------
+
+    def _ensure_snapshot_store(self):
+        """Lazy-init the tiered snapshot store; return None if disabled."""
+        if hasattr(self, "_snapshot_store"):
+            return self._snapshot_store
+        cc = self.vllm_config.cache_config
+        if not getattr(cc, "kv_snapshot_enabled", False):
+            self._snapshot_store = None
+            return None
+        from vllm.kv_snapshot.storage import (
+            DiskSnapshotStore,
+            MemorySnapshotStore,
+            TieredSnapshotStore,
+        )
+
+        self._snapshot_store = TieredSnapshotStore(
+            warm=MemorySnapshotStore(),
+            cold=DiskSnapshotStore(cc.kv_snapshot_dir),
+            warm_max_bytes=cc.kv_snapshot_warm_max_bytes,
+            ttl_seconds=cc.kv_snapshot_ttl_seconds,
+        )
+        # Track blocks held by an active restore so we can release them on
+        # delete. Each entry is the list[KVCacheBlock] returned by the pool.
+        self._restored_block_holds: dict[str, list] = {}
+        return self._snapshot_store
+
+    def snapshot_kv_cache(
+        self, request_id: str, snapshot_id: str | None = None
+    ) -> dict:
+        """Snapshot the KV cache of an in-flight request to the store.
+
+        Reads each allocated block from every TP rank, concatenates the
+        rank-local KV-head slices along the kv_heads dim, and saves the
+        full-head tensor under ``snapshot_id``. The request is left untouched.
+        """
+        store = self._ensure_snapshot_store()
+        if store is None:
+            raise RuntimeError(
+                "KV snapshot is disabled; pass --kv-snapshot-enabled to "
+                "the server to enable"
+            )
+
+        started = time.time()
+
+        request = self.scheduler.requests.get(request_id)
+        if request is None:
+            raise ValueError(
+                f"request {request_id!r} not found in scheduler"
+            )
+
+        block_ids_per_group = self.scheduler.kv_cache_manager.get_block_ids(
+            request_id
+        )
+        if len(block_ids_per_group) != 1:
+            raise RuntimeError(
+                "KV snapshot only supports single-group KV caches; got "
+                f"{len(block_ids_per_group)} groups"
+            )
+        block_ids = list(block_ids_per_group[0])
+        if not block_ids:
+            raise RuntimeError(
+                f"request {request_id!r} has no allocated KV blocks"
+            )
+
+        # Each rank returns dict[block_id, Tensor] with shape
+        # [2, num_layers, block_size, num_kv_heads_local, head_size].
+        shards_per_rank = self.collective_rpc(
+            "read_kv_blocks", args=(block_ids,)
+        )
+
+        import torch
+
+        block_data: dict[int, torch.Tensor] = {}
+        for block_id in block_ids:
+            per_rank = [shards[block_id] for shards in shards_per_rank]
+            if len(per_rank) == 1:
+                block_data[block_id] = per_rank[0]
+            else:
+                # Gather across TP ranks along the kv_heads dim.
+                block_data[block_id] = torch.cat(per_rank, dim=3)
+
+        kv_cache_config = self.scheduler.kv_cache_config
+        group = kv_cache_config.kv_cache_groups[0]
+        spec = group.kv_cache_spec
+        num_layers = len(group.layer_names)
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        num_kv_heads_total = spec.num_kv_heads * tp_size
+
+        if snapshot_id is None:
+            from uuid import uuid4
+
+            snapshot_id = f"snap-{uuid4().hex[:12]}"
+
+        block_hashes: dict[int, bytes | None] = {bid: None for bid in block_ids}
+
+        from vllm.v1.core.kv_cache_manager import create_snapshot_from_blocks
+
+        snapshot = create_snapshot_from_blocks(
+            snapshot_id=snapshot_id,
+            request_id=request_id,
+            block_ids=block_ids,
+            block_data=block_data,
+            block_hashes=block_hashes,
+            num_tokens=request.num_tokens,
+            block_size=spec.block_size,
+            dtype=spec.dtype,
+            num_kv_heads=num_kv_heads_total,
+            head_size=spec.head_size,
+            num_layers=num_layers,
+        )
+        store.save(snapshot)
+
+        elapsed_ms = (time.time() - started) * 1000.0
+        status = store.status(snapshot_id) or {}
+        return {
+            "snapshot_id": snapshot_id,
+            "request_id": request_id,
+            "num_blocks": snapshot.metadata.num_blocks,
+            "num_tokens": snapshot.metadata.num_tokens,
+            "size_bytes": snapshot.metadata.estimated_size_bytes,
+            "tier": status.get("tier", "warm"),
+            "latency_ms": elapsed_ms,
+        }
+
+    def restore_kv_cache(self, snapshot_id: str) -> dict | None:
+        """Load a snapshot and write its blocks into fresh GPU blocks.
+
+        Allocates ``num_blocks`` blocks from the pool, splits each block's
+        full-head tensor into ``tp_size`` slices along the kv_heads dim, and
+        scatters the slices to all TP ranks via ``collective_rpc``. The
+        allocated blocks are held by EngineCore (ref_cnt += 1) until
+        ``delete_kv_snapshot`` releases them. Wiring the new blocks to a
+        request slot for re-prefill is left to a follow-up commit.
+
+        Returns ``None`` if the snapshot doesn't exist.
+        """
+        store = self._ensure_snapshot_store()
+        if store is None:
+            raise RuntimeError(
+                "KV snapshot is disabled; pass --kv-snapshot-enabled to "
+                "the server to enable"
+            )
+
+        started = time.time()
+        # Capture the pre-load tier — load() promotes cold→warm.
+        pre_status = store.status(snapshot_id)
+        if pre_status is None:
+            return None
+        pre_tier = pre_status.get("tier", "unknown")
+
+        snapshot = store.load(snapshot_id)
+        if snapshot is None:
+            return None
+
+        if snapshot_id in self._restored_block_holds:
+            raise RuntimeError(
+                f"snapshot {snapshot_id!r} is already restored; delete it "
+                "first before restoring again"
+            )
+
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        num_blocks = len(snapshot.blocks)
+        new_blocks = block_pool.get_new_blocks(num_blocks)
+        new_block_ids = [b.block_id for b in new_blocks]
+
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+
+        import torch
+
+        shards_per_rank: list[list[torch.Tensor]] = [
+            [] for _ in range(tp_size)
+        ]
+        for block in snapshot.blocks:
+            data = block.data
+            kv_heads_total = data.shape[3]
+            if kv_heads_total % tp_size != 0:
+                # Roll back the allocation before bailing.
+                block_pool.free_blocks(reversed(new_blocks))
+                raise RuntimeError(
+                    f"snapshot {snapshot_id!r} has {kv_heads_total} kv "
+                    f"heads but tp_size={tp_size}; not divisible"
+                )
+            per_rank = torch.chunk(data, tp_size, dim=3)
+            for rank in range(tp_size):
+                shards_per_rank[rank].append(per_rank[rank].contiguous())
+
+        self.collective_rpc(
+            "write_kv_blocks",
+            args=(new_block_ids, shards_per_rank),
+        )
+
+        self._restored_block_holds[snapshot_id] = new_blocks
+
+        elapsed_ms = (time.time() - started) * 1000.0
+        return {
+            "snapshot_id": snapshot_id,
+            "num_blocks": num_blocks,
+            "tier": pre_tier,
+            "latency_ms": elapsed_ms,
+            "new_block_ids": new_block_ids,
+        }
+
+    def delete_kv_snapshot(self, snapshot_id: str) -> dict:
+        """Free any held blocks and remove the snapshot from the store."""
+        store = self._ensure_snapshot_store()
+        if store is None:
+            raise RuntimeError(
+                "KV snapshot is disabled; pass --kv-snapshot-enabled to "
+                "the server to enable"
+            )
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        held = self._restored_block_holds.pop(snapshot_id, None)
+        if held is not None:
+            block_pool.free_blocks(reversed(held))
+        deleted = store.delete(snapshot_id)
+        return {"status": "deleted" if deleted else "not_found"}
+
+    def get_kv_snapshot_status(self, snapshot_id: str) -> dict | None:
+        """Return the snapshot's status dict (or None if missing/disabled)."""
+        store = self._ensure_snapshot_store()
+        if store is None:
+            return None
+        return store.status(snapshot_id)
+
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True
     ) -> Future | None:
