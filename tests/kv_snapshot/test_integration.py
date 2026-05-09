@@ -42,25 +42,29 @@ import pytest
 import requests
 import torch
 
-# Architectural twin of the production deployment but ~30x smaller.
-# Both are standard transformer with GQA + FlashAttention KV layout,
-# no MLA, no sliding-window. Same code paths, faster fixture.
+# Defaults target the production deployment shape: 2× RTX 4090 with
+# Qwen2.5 (architecturally — standard multi-head GQA, FlashAttention
+# KV layout, no MLA, no sliding window). The 0.5B variant is the same
+# architecture as the production model, just small enough to spin up
+# in a test fixture in a few seconds. Override via the env vars to
+# point at the production-size model for a deeper smoke.
 TEST_MODEL = os.environ.get(
     "VLLM_KV_SNAPSHOT_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct"
 )
-TEST_TP_SIZE = int(os.environ.get("VLLM_KV_SNAPSHOT_TEST_TP_SIZE", "1"))
+TEST_TP_SIZE = int(os.environ.get("VLLM_KV_SNAPSHOT_TEST_TP_SIZE", "2"))
 
 
-# Opt-in: this test downloads a model and spins up a real vLLM server.
-# Set VLLM_KV_SNAPSHOT_INTEGRATION=1 to enable. (We don't auto-enable
-# on torch.cuda.is_available() because that returns True on GPUs whose
-# compute capability is too old for current PyTorch — the server would
-# fail to start and the test would error rather than skip cleanly.)
+# Opt-in: this test downloads a model and spins up a real vLLM server,
+# so it shouldn't fire in default pytest sweeps. Set
+# VLLM_KV_SNAPSHOT_INTEGRATION=1 to enable.
 pytestmark = [
     pytest.mark.skipif(
         os.environ.get("VLLM_KV_SNAPSHOT_INTEGRATION") != "1",
-        reason="set VLLM_KV_SNAPSHOT_INTEGRATION=1 to enable "
-        "(requires GPU with PyTorch-compatible compute capability)",
+        reason="set VLLM_KV_SNAPSHOT_INTEGRATION=1 to enable",
+    ),
+    pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="KV snapshot integration requires CUDA",
     ),
     pytest.mark.skipif(
         torch.cuda.is_available()
