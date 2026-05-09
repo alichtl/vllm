@@ -288,6 +288,12 @@ class EngineCoreClient(ABC):
     ) -> dict | None:
         raise NotImplementedError
 
+    async def release_snapshot_holds_async(self, snapshot_id: str) -> dict:
+        raise NotImplementedError
+
+    async def release_all_snapshot_holds_async(self) -> dict:
+        raise NotImplementedError
+
 
 class InprocClient(EngineCoreClient):
     """
@@ -1161,6 +1167,14 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "get_kv_snapshot_status", snapshot_id
         )
+
+    async def release_snapshot_holds_async(self, snapshot_id: str) -> dict:
+        return await self.call_utility_async(
+            "release_snapshot_holds", snapshot_id
+        )
+
+    async def release_all_snapshot_holds_async(self) -> dict:
+        return await self.call_utility_async("release_all_snapshot_holds")
 
 
 class DPAsyncMPClient(AsyncMPClient):

@@ -875,16 +875,58 @@ class EngineCore:
                 "KV snapshot is disabled; pass --kv-snapshot-enabled to "
                 "the server to enable"
             )
-        block_pool = self.scheduler.kv_cache_manager.block_pool
-        held = self._restored_block_holds.pop(snapshot_id, None)
-        if held is not None:
-            # Evict any prefix-cache entries we registered on restore before
-            # freeing — otherwise the hash table would point at a block we
-            # may immediately re-allocate to someone else.
-            block_pool.evict_blocks({b.block_id for b in held})
-            block_pool.free_blocks(reversed(held))
+        self._release_holds(snapshot_id)
         deleted = store.delete(snapshot_id)
         return {"status": "deleted" if deleted else "not_found"}
+
+    def release_snapshot_holds(self, snapshot_id: str) -> dict:
+        """Free the blocks held by a prior restore of one snapshot without
+        deleting the snapshot itself."""
+        # No store check — releasing holds is a no-op if disabled, and we
+        # don't want this to error out in the middle of a tenant swap.
+        released = self._release_holds(snapshot_id)
+        return {
+            "status": "released" if released else "no_holds",
+            "snapshot_id": snapshot_id,
+        }
+
+    def release_all_snapshot_holds(self) -> dict:
+        """Free every block held by every prior restore.
+
+        This is the swap-path primitive: ``reset_prefix_cache`` requires
+        ref_cnt == 0 on all non-null blocks, but every prior restore (a
+        session restore for the outgoing tenant, plus any per-frame
+        snapshots that were restored mid-turn) keeps holds alive.
+        Releasing them all in one shot makes the subsequent reset safe
+        without needing to enumerate snapshot ids in the caller.
+
+        On-store snapshots are preserved — only the on-GPU holds are
+        released. A later restore re-allocates fresh blocks.
+        """
+        if not hasattr(self, "_restored_block_holds"):
+            return {"status": "no_holds", "released_snapshots": []}
+        ids = list(self._restored_block_holds.keys())
+        for sid in ids:
+            self._release_holds(sid)
+        return {
+            "status": "released" if ids else "no_holds",
+            "released_snapshots": ids,
+        }
+
+    def _release_holds(self, snapshot_id: str) -> bool:
+        """Free any blocks held under ``snapshot_id``. Returns True if there
+        were holds to release."""
+        if not hasattr(self, "_restored_block_holds"):
+            return False
+        held = self._restored_block_holds.pop(snapshot_id, None)
+        if held is None:
+            return False
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        # Evict prefix-cache entries before freeing — otherwise the hash
+        # table would point at a block we may immediately re-allocate.
+        block_pool.evict_blocks({b.block_id for b in held})
+        block_pool.free_blocks(reversed(held))
+        return True
 
     def get_kv_snapshot_status(self, snapshot_id: str) -> dict | None:
         """Return the snapshot's status dict (or None if missing/disabled)."""

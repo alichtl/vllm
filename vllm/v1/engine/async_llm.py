@@ -922,6 +922,12 @@ class AsyncLLM(EngineClient):
     ) -> dict | None:
         return await self.engine_core.get_kv_snapshot_status_async(snapshot_id)
 
+    async def release_snapshot_holds(self, snapshot_id: str) -> dict:
+        return await self.engine_core.release_snapshot_holds_async(snapshot_id)
+
+    async def release_all_snapshot_holds(self) -> dict:
+        return await self.engine_core.release_all_snapshot_holds_async()
+
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.engine_core.sleep_async(level, mode)
 

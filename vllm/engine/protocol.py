@@ -177,6 +177,23 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def release_snapshot_holds(self, snapshot_id: str) -> dict:
+        """Free blocks held by a prior restore of one snapshot without
+        deleting the snapshot itself."""
+        ...
+
+    @abstractmethod
+    async def release_all_snapshot_holds(self) -> dict:
+        """Free every block held by every prior restore.
+
+        Used by the tenant-swap path: ``reset_prefix_cache`` requires
+        ref_cnt == 0 on all non-null blocks, and every prior restore (the
+        outgoing tenant's session plus any per-frame restores still live)
+        keeps blocks pinned. On-store snapshots are preserved.
+        """
+        ...
+
+    @abstractmethod
     async def sleep(self, level: int = 1, mode: "PauseMode" = "abort") -> None:
         """Sleep the engine"""
         ...
