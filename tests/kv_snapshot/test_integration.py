@@ -92,15 +92,15 @@ def _wait_for_health(base_url: str, timeout: float = 120.0) -> None:
     )
 
 
-@pytest.fixture(scope="module")
-def server() -> Iterator[str]:
-    """Spin up a real vLLM server with KV snapshot enabled.
+def _spawn_server(port: int, *, enable_tenant_switcher: bool) -> Iterator[str]:
+    """Spawn a real vLLM server, yield its base URL, tear down on exit.
 
-    Yields the base URL. Runs once per test module (start cost is the
-    dominant time). The snapshot dir is wiped between modules.
+    enable_tenant_switcher controls whether the OpenAI completions
+    endpoints are gated by the tenant middleware. Each test class that
+    needs a different config gets its own fixture and its own port so
+    the configurations don't collide.
     """
     snap_dir = tempfile.mkdtemp(prefix="vllm-kv-snap-test-")
-    port = int(os.environ.get("VLLM_KV_SNAPSHOT_TEST_PORT", "8765"))
     cmd = [
         sys.executable,
         "-m",
@@ -114,6 +114,8 @@ def server() -> Iterator[str]:
         "--kv-snapshot-enabled",
         "--kv-snapshot-dir", snap_dir,
     ]
+    if enable_tenant_switcher:
+        cmd.append("--enable-tenant-switcher")
     env = os.environ.copy()
     # Allow any snapshot id prefix in the test (no allowlist enforcement).
     env.pop("VLLM_KV_SNAPSHOT_ALLOWED_PREFIXES", None)
@@ -131,6 +133,21 @@ def server() -> Iterator[str]:
             proc.kill()
             proc.wait()
         shutil.rmtree(snap_dir, ignore_errors=True)
+
+
+@pytest.fixture(scope="module")
+def server() -> Iterator[str]:
+    """Plain server: tenant middleware OFF. Use for direct /kv/* tests."""
+    port = int(os.environ.get("VLLM_KV_SNAPSHOT_TEST_PORT", "8765"))
+    yield from _spawn_server(port, enable_tenant_switcher=False)
+
+
+@pytest.fixture(scope="module")
+def server_with_tenant_switcher() -> Iterator[str]:
+    """Server with the tenant middleware installed. Inbound completions
+    requests must carry X-Tenant-Id."""
+    port = int(os.environ.get("VLLM_KV_SNAPSHOT_TENANT_TEST_PORT", "8766"))
+    yield from _spawn_server(port, enable_tenant_switcher=True)
 
 
 def _completion(server_url: str, prompt: str, **extra) -> dict:
@@ -238,81 +255,72 @@ class TestApiRoundTrip:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="Tenant middleware is opt-in and not installed by the default "
-    "vLLM api_server entry point. Run this test against a server that "
-    "has install_tenant_switcher() called on its FastAPI app — see "
-    "tests/entrypoints/serve/cache/test_tenant_switcher.py for the "
-    "integration shape, and the README for production wiring."
-)
 class TestTenantSwapRoundTrip:
-    """A → B → A swap through the X-Tenant-Id middleware on a real model.
+    """A → B → A swap through the tenant header middleware on a real model.
 
     Asserts:
-      - Tenant A's deterministic output is recovered after Bob ran in
-        between (Bob's writes don't pollute Alice's restored state).
-      - Bob never sees a prefix cache hit for Alice's hashes mid-turn.
-
-    To run: stand up a server with install_tenant_switcher() wired to
-    the FastAPI app and unskip this class. The test body below is the
-    contract.
+      - Tenant A's deterministic output is recovered after B ran in
+        between (B's writes don't pollute A's restored state).
+      - A request without the tenant header is rejected with 400.
+      - Mismatched tenant on the same prompt does not produce a stale
+        prefix-cache hit (no leak across tenants).
     """
 
-    def test_alice_state_survives_bob_turn(self, server):
+    @staticmethod
+    def _completion(server_url: str, prompt: str, tenant: str | None,
+                    max_tokens: int = 32, seed: int = 42, **extra) -> requests.Response:
+        headers = {}
+        if tenant is not None:
+            headers["X-Tenant-Id"] = tenant
+        return requests.post(
+            f"{server_url}/v1/completions",
+            json={
+                "model": TEST_MODEL,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "seed": seed,
+                **extra,
+            },
+            headers=headers,
+            timeout=60,
+        )
+
+    def test_request_without_header_rejected(self, server_with_tenant_switcher):
+        r = self._completion(server_with_tenant_switcher, "hello", tenant=None)
+        assert r.status_code == 400, r.text
+        assert "X-Tenant-Id" in r.text
+
+    def test_tenant_state_survives_swap(self, server_with_tenant_switcher):
         prompt = (
             "Once upon a time in a small village by the sea, there lived "
             "a fisherman named"
         )
 
-        # Alice's first turn: build cache state.
-        r = requests.post(
-            f"{server}/v1/completions",
-            json={
-                "model": TEST_MODEL,
-                "prompt": prompt,
-                "max_tokens": 32,
-                "temperature": 0.0,
-                "seed": 42,
-            },
-            headers={"X-Tenant-Id": "alice"},
-            timeout=60,
-        )
+        # Tenant A's first turn: build cache state.
+        r = self._completion(server_with_tenant_switcher, prompt, tenant="alice")
         r.raise_for_status()
         alice_first = r.json()["choices"][0]["text"]
 
-        # Bob's turn (different prompt — triggers swap).
-        r = requests.post(
-            f"{server}/v1/completions",
-            json={
-                "model": TEST_MODEL,
-                "prompt": "The square root of 144 is",
-                "max_tokens": 8,
-                "temperature": 0.0,
-                "seed": 1,
-            },
-            headers={"X-Tenant-Id": "bob"},
-            timeout=60,
+        # Tenant B's turn (different prompt — triggers swap).
+        r = self._completion(
+            server_with_tenant_switcher,
+            "The square root of 144 is",
+            tenant="bob",
+            max_tokens=8,
+            seed=1,
         )
         r.raise_for_status()
 
-        # Alice returns. Same prompt — should produce identical output.
-        r = requests.post(
-            f"{server}/v1/completions",
-            json={
-                "model": TEST_MODEL,
-                "prompt": prompt,
-                "max_tokens": 32,
-                "temperature": 0.0,
-                "seed": 42,
-            },
-            headers={"X-Tenant-Id": "alice"},
-            timeout=60,
-        )
+        # Tenant A returns with the same prompt — output must be identical.
+        # If the swap corrupted state or the restore failed silently, the
+        # generation would diverge.
+        r = self._completion(server_with_tenant_switcher, prompt, tenant="alice")
         r.raise_for_status()
         alice_second = r.json()["choices"][0]["text"]
 
         assert alice_second == alice_first, (
-            "Alice's deterministic output diverged across the swap — "
+            "Tenant A's deterministic output diverged across the swap — "
             "the restore did not preserve KV state correctly.\n"
             f"  before: {alice_first!r}\n  after:  {alice_second!r}"
         )
