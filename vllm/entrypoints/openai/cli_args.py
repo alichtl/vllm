@@ -278,6 +278,28 @@ class FrontendArgs(BaseFrontendArgs):
     Enable offline FastAPI documentation for air-gapped environments.
     Uses vendored static assets bundled with vLLM.
     """
+    enable_tenant_switcher: bool = False
+    """
+    Enable the time-sliced tenant switch middleware on the OpenAI
+    completions endpoints. When set, every inbound request to
+    /v1/chat/completions, /v1/completions, and /v1/responses must
+    carry an X-Tenant-Id header (configurable via --tenant-header).
+    On tenant change the server atomically snapshots the outgoing
+    tenant's KV cache to <tenant>_active, releases all snapshot
+    holds, resets the prefix cache, and restores the incoming
+    tenant's snapshot if one exists. Designed for sharing a single
+    vLLM instance across multiple tenants one-at-a-time, with the
+    KV cache acting as per-tenant session state. Requires
+    --kv-snapshot-enabled.
+    """
+    tenant_header: str = "X-Tenant-Id"
+    """
+    HTTP header name the tenant switch middleware reads to identify
+    the active tenant. Only meaningful when --enable-tenant-switcher
+    is set. The header value is treated as ground truth — the trust
+    perimeter must be the network (e.g., a NetworkPolicy or upstream
+    gateway), not the API.
+    """
 
     @classmethod
     def _customize_cli_kwargs(

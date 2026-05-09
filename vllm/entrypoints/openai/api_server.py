@@ -593,6 +593,24 @@ async def build_and_serve(
     app = build_app(args, supported_tasks, model_config)
     await init_app_state(engine_client, app.state, args, supported_tasks)
 
+    # Tenant-aware KV cache swap. Installed last so it wraps the
+    # already-attached completions endpoints, and so the engine_client
+    # is guaranteed to be on app.state.
+    if getattr(args, "enable_tenant_switcher", False):
+        from vllm.entrypoints.serve.cache.tenant_switcher import (
+            install_tenant_switcher,
+        )
+
+        install_tenant_switcher(
+            app,
+            engine_client=engine_client,
+            tenant_header=args.tenant_header,
+        )
+        logger.info(
+            "Tenant switch middleware installed (header=%s)",
+            args.tenant_header,
+        )
+
     logger.info("Starting vLLM server on %s", listen_address)
 
     return await serve_http(
