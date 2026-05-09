@@ -17,7 +17,9 @@ import torch
 from vllm.v1.core.kv_cache_manager import (
     create_snapshot_from_blocks,
     prepare_restore_data,
+    register_restored_blocks_in_prefix_cache,
 )
+from vllm.v1.core.kv_cache_snapshot import SnapshotBlockData
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -214,6 +216,111 @@ def test_worker_read_kv_blocks_returns_dict_keyed_by_id():
     # fills it with the block_id value so we can identify the mapping.
     torch.testing.assert_close(out[3], torch.full((2, 1, 1, 1, 1), 3.0))
     torch.testing.assert_close(out[7], torch.full((2, 1, 1, 1, 1), 7.0))
+
+
+def _make_block_pool(num_blocks: int = 16, enable_caching: bool = True):
+    """Construct a real BlockPool — no GPU needed, KVCacheBlock is plain Python."""
+    from vllm.v1.core.block_pool import BlockPool
+
+    return BlockPool(
+        num_gpu_blocks=num_blocks,
+        enable_caching=enable_caching,
+        hash_block_size=16,
+    )
+
+
+def _snap_block(block_id: int, hash_: bytes | None) -> SnapshotBlockData:
+    """A snapshot block with the bare minimum the wiring helper inspects."""
+    return SnapshotBlockData(
+        block_id=block_id, block_hash=hash_, data=torch.zeros(1)
+    )
+
+
+def test_register_restored_blocks_inserts_hashes_into_prefix_cache():
+    """A restored block whose snapshot recorded a hash becomes discoverable
+    via cached_block_hash_to_block, mirroring the path normal cache_blocks
+    takes for newly-full blocks."""
+    pool = _make_block_pool()
+    # Allocate two fresh blocks — these stand in for what restore_kv_cache
+    # got back from get_new_blocks.
+    restored = pool.get_new_blocks(2)
+    snap_blocks = [
+        _snap_block(restored[0].block_id, b"hash-a-with-group-id"),
+        _snap_block(restored[1].block_id, b"hash-b-with-group-id"),
+    ]
+
+    n = register_restored_blocks_in_prefix_cache(pool, restored, snap_blocks)
+
+    assert n == 2
+    assert restored[0].block_hash == b"hash-a-with-group-id"
+    assert restored[1].block_hash == b"hash-b-with-group-id"
+    # Cache lookup returns the same block objects we registered.
+    assert pool.cached_block_hash_to_block.get_one_block(
+        b"hash-a-with-group-id"
+    ) is restored[0]
+    assert pool.cached_block_hash_to_block.get_one_block(
+        b"hash-b-with-group-id"
+    ) is restored[1]
+
+
+def test_register_skips_blocks_with_none_hash():
+    """A snapshot block with block_hash=None (the partial trailing block of a
+    request) gets data restored but no prefix-cache registration — there's
+    nothing for a future request to look it up by."""
+    pool = _make_block_pool()
+    restored = pool.get_new_blocks(2)
+    snap_blocks = [
+        _snap_block(restored[0].block_id, b"hash-a"),
+        _snap_block(restored[1].block_id, None),  # partial block
+    ]
+
+    n = register_restored_blocks_in_prefix_cache(pool, restored, snap_blocks)
+
+    assert n == 1
+    assert restored[1].block_hash is None
+    assert len(pool.cached_block_hash_to_block) == 1
+
+
+def test_register_is_noop_when_caching_disabled():
+    """No prefix cache exists to register into; helper must early-out cleanly."""
+    pool = _make_block_pool(enable_caching=False)
+    restored = pool.get_new_blocks(1)
+    snap_blocks = [_snap_block(restored[0].block_id, b"hash-a")]
+
+    n = register_restored_blocks_in_prefix_cache(pool, restored, snap_blocks)
+
+    assert n == 0
+    assert restored[0].block_hash is None
+    assert len(pool.cached_block_hash_to_block) == 0
+
+
+def test_register_rejects_length_mismatch():
+    pool = _make_block_pool()
+    restored = pool.get_new_blocks(2)
+    snap_blocks = [_snap_block(restored[0].block_id, b"hash-a")]
+
+    with pytest.raises(ValueError, match="restored vs"):
+        register_restored_blocks_in_prefix_cache(pool, restored, snap_blocks)
+
+
+def test_evict_blocks_removes_restored_hashes_from_prefix_cache():
+    """Mirrors what delete_kv_snapshot does: evict the hashes the restore
+    registered before freeing the blocks. Without this step the cache map
+    would point at a block that's about to be re-allocated to someone else."""
+    pool = _make_block_pool()
+    restored = pool.get_new_blocks(2)
+    snap_blocks = [
+        _snap_block(restored[0].block_id, b"hash-a"),
+        _snap_block(restored[1].block_id, b"hash-b"),
+    ]
+    register_restored_blocks_in_prefix_cache(pool, restored, snap_blocks)
+    assert len(pool.cached_block_hash_to_block) == 2
+
+    pool.evict_blocks({b.block_id for b in restored})
+
+    assert len(pool.cached_block_hash_to_block) == 0
+    assert restored[0].block_hash is None
+    assert restored[1].block_hash is None
 
 
 def test_cache_config_kv_snapshot_defaults():

@@ -624,3 +624,40 @@ def prepare_restore_data(
         new_id: block.data
         for new_id, block in zip(new_block_ids, snapshot.blocks)
     }
+
+
+def register_restored_blocks_in_prefix_cache(
+    block_pool,
+    restored_blocks: list[KVCacheBlock],
+    snapshot_blocks: list,
+) -> int:
+    """Make restored blocks discoverable by the prefix cache.
+
+    For each (new_block, snapshot_block) pair, if the snapshot recorded a
+    non-None ``block_hash`` (i.e. the block was full and cached at snapshot
+    time), copy the hash onto the freshly allocated block and insert the
+    pair into ``block_pool.cached_block_hash_to_block``. A subsequent
+    request whose tokens hash to the same value will then transparently
+    hit the restored block via the existing ``get_computed_blocks`` path.
+
+    No-op when ``block_pool.enable_caching`` is False — without prefix
+    caching there is no hash table to populate.
+
+    Returns the number of blocks registered.
+    """
+    if not block_pool.enable_caching:
+        return 0
+    if len(restored_blocks) != len(snapshot_blocks):
+        raise ValueError(
+            f"Block count mismatch: {len(restored_blocks)} restored vs "
+            f"{len(snapshot_blocks)} snapshot blocks"
+        )
+    registered = 0
+    for new_block, snap_block in zip(restored_blocks, snapshot_blocks):
+        block_hash = snap_block.block_hash
+        if block_hash is None:
+            continue
+        new_block.block_hash = block_hash
+        block_pool.cached_block_hash_to_block.insert(block_hash, new_block)
+        registered += 1
+    return registered

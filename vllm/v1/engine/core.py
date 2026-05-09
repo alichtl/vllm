@@ -656,19 +656,20 @@ class EngineCore:
                 f"request {request_id!r} not found in scheduler"
             )
 
-        block_ids_per_group = self.scheduler.kv_cache_manager.get_block_ids(
+        request_blocks = self.scheduler.kv_cache_manager.get_blocks(
             request_id
         )
-        if len(block_ids_per_group) != 1:
+        if len(request_blocks.blocks) != 1:
             raise RuntimeError(
                 "KV snapshot only supports single-group KV caches; got "
-                f"{len(block_ids_per_group)} groups"
+                f"{len(request_blocks.blocks)} groups"
             )
-        block_ids = list(block_ids_per_group[0])
-        if not block_ids:
+        group_blocks = list(request_blocks.blocks[0])
+        if not group_blocks:
             raise RuntimeError(
                 f"request {request_id!r} has no allocated KV blocks"
             )
+        block_ids = [b.block_id for b in group_blocks]
 
         # Each rank returns dict[block_id, Tensor] with shape
         # [2, num_layers, block_size, num_kv_heads_local, head_size].
@@ -699,7 +700,14 @@ class EngineCore:
 
             snapshot_id = f"snap-{uuid4().hex[:12]}"
 
-        block_hashes: dict[int, bytes | None] = {bid: None for bid in block_ids}
+        # Capture each block's prefix-cache hash so a future restore can
+        # re-register them in the prefix cache. Non-full blocks have
+        # block_hash=None — these still get snapshotted but won't be
+        # discoverable by hash on restore (only the request that wrote
+        # them could match the partial-block content).
+        block_hashes: dict[int, bytes | None] = {
+            b.block_id: b.block_hash for b in group_blocks
+        }
 
         from vllm.v1.core.kv_cache_manager import create_snapshot_from_blocks
 
@@ -737,8 +745,13 @@ class EngineCore:
         full-head tensor into ``tp_size`` slices along the kv_heads dim, and
         scatters the slices to all TP ranks via ``collective_rpc``. The
         allocated blocks are held by EngineCore (ref_cnt += 1) until
-        ``delete_kv_snapshot`` releases them. Wiring the new blocks to a
-        request slot for re-prefill is left to a follow-up commit.
+        ``delete_kv_snapshot`` releases them.
+
+        Each restored block whose snapshot recorded a non-None block hash is
+        re-registered in the block pool's prefix cache, so the next request
+        whose tokens hash to the same value transparently sees the restored
+        block as a prefix-cache hit via the standard ``get_computed_blocks``
+        path.
 
         Returns ``None`` if the snapshot doesn't exist.
         """
@@ -797,12 +810,23 @@ class EngineCore:
             args=(new_block_ids, shards_per_rank),
         )
 
+        from vllm.v1.core.kv_cache_manager import (
+            register_restored_blocks_in_prefix_cache,
+        )
+
+        num_registered = register_restored_blocks_in_prefix_cache(
+            block_pool=block_pool,
+            restored_blocks=new_blocks,
+            snapshot_blocks=snapshot.blocks,
+        )
+
         self._restored_block_holds[snapshot_id] = new_blocks
 
         elapsed_ms = (time.time() - started) * 1000.0
         return {
             "snapshot_id": snapshot_id,
             "num_blocks": num_blocks,
+            "num_registered_in_prefix_cache": num_registered,
             "tier": pre_tier,
             "latency_ms": elapsed_ms,
             "new_block_ids": new_block_ids,
@@ -819,6 +843,10 @@ class EngineCore:
         block_pool = self.scheduler.kv_cache_manager.block_pool
         held = self._restored_block_holds.pop(snapshot_id, None)
         if held is not None:
+            # Evict any prefix-cache entries we registered on restore before
+            # freeing — otherwise the hash table would point at a block we
+            # may immediately re-allocate to someone else.
+            block_pool.evict_blocks({b.block_id for b in held})
             block_pool.free_blocks(reversed(held))
         deleted = store.delete(snapshot_id)
         return {"status": "deleted" if deleted else "not_found"}
