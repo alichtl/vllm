@@ -903,7 +903,9 @@ class AsyncLLM(EngineClient):
         await self.engine_core.reset_encoder_cache_async()
 
     async def snapshot_kv_cache(
-        self, request_id: str, snapshot_id: str | None = None
+        self,
+        request_id: str | None = None,
+        snapshot_id: str | None = None,
     ) -> dict:
         return await self.engine_core.snapshot_kv_cache_async(
             request_id, snapshot_id

@@ -303,6 +303,50 @@ def test_register_rejects_length_mismatch():
         register_restored_blocks_in_prefix_cache(pool, restored, snap_blocks)
 
 
+def test_iter_cached_blocks_yields_single_block_entries():
+    """iter_blocks underpins session-mode snapshot — it must yield every
+    cached block as a (hash, block) pair."""
+    pool = _make_block_pool()
+    blks = pool.get_new_blocks(3)
+    snap_blocks = [
+        _snap_block(b.block_id, h)
+        for b, h in zip(blks, [b"hash-a", b"hash-b", b"hash-c"])
+    ]
+    register_restored_blocks_in_prefix_cache(pool, blks, snap_blocks)
+
+    pairs = list(pool.cached_block_hash_to_block.iter_blocks())
+    assert len(pairs) == 3
+    assert {h for h, _ in pairs} == {b"hash-a", b"hash-b", b"hash-c"}
+    # Each yielded block matches the one we registered.
+    by_hash = dict(pairs)
+    assert by_hash[b"hash-a"] is blks[0]
+    assert by_hash[b"hash-b"] is blks[1]
+    assert by_hash[b"hash-c"] is blks[2]
+
+
+def test_iter_cached_blocks_handles_dict_fallback_for_duplicate_hash():
+    """When two cached blocks share a hash the map promotes to a dict (per
+    NOTE #1 on BlockHashToBlockMap). iter_blocks should yield both."""
+    pool = _make_block_pool()
+    blks = pool.get_new_blocks(2)
+    # Force both blocks under the same hash via the helper's normal path.
+    snap_blocks = [
+        _snap_block(blks[0].block_id, b"shared-hash"),
+        _snap_block(blks[1].block_id, b"shared-hash"),
+    ]
+    register_restored_blocks_in_prefix_cache(pool, blks, snap_blocks)
+
+    pairs = list(pool.cached_block_hash_to_block.iter_blocks())
+    assert len(pairs) == 2
+    assert all(h == b"shared-hash" for h, _ in pairs)
+    assert {blk.block_id for _, blk in pairs} == {b.block_id for b in blks}
+
+
+def test_iter_cached_blocks_empty_pool_yields_nothing():
+    pool = _make_block_pool()
+    assert list(pool.cached_block_hash_to_block.iter_blocks()) == []
+
+
 def test_evict_blocks_removes_restored_hashes_from_prefix_cache():
     """Mirrors what delete_kv_snapshot does: evict the hashes the restore
     registered before freeing the blocks. Without this step the cache map

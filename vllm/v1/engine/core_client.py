@@ -271,7 +271,9 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def snapshot_kv_cache_async(
-        self, request_id: str, snapshot_id: str | None = None
+        self,
+        request_id: str | None = None,
+        snapshot_id: str | None = None,
     ) -> dict:
         raise NotImplementedError
 
@@ -1137,7 +1139,9 @@ class AsyncMPClient(MPClient):
         )
 
     async def snapshot_kv_cache_async(
-        self, request_id: str, snapshot_id: str | None = None
+        self,
+        request_id: str | None = None,
+        snapshot_id: str | None = None,
     ) -> dict:
         return await self.call_utility_async(
             "snapshot_kv_cache", request_id, snapshot_id

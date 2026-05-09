@@ -68,9 +68,45 @@ class TestSnapshotEndpoint:
         assert resp.status_code == 200
         engine.snapshot_kv_cache.assert_called_once_with("req-2", "my-snap")
 
-    def test_snapshot_missing_request_id(self, client, engine):
+    def test_snapshot_session_mode_omitted_request_id(self, client, engine):
+        """Omitting request_id triggers whole-prefix-cache (session) mode."""
+        engine.snapshot_kv_cache.return_value = {
+            "snapshot_id": "snap-sess",
+            "mode": "session",
+            "num_blocks": 12,
+            "tier": "warm",
+            "latency_ms": 4.0,
+        }
         resp = client.post("/kv/snapshot", json={})
-        assert resp.status_code == 422
+        assert resp.status_code == 200
+        engine.snapshot_kv_cache.assert_called_once_with(None, None)
+
+    def test_snapshot_session_mode_explicit_null_request_id(self, client, engine):
+        engine.snapshot_kv_cache.return_value = {
+            "snapshot_id": "snap-sess2",
+            "mode": "session",
+            "num_blocks": 0,
+            "tier": "warm",
+            "latency_ms": 1.0,
+        }
+        resp = client.post(
+            "/kv/snapshot", json={"request_id": None, "snapshot_id": "snap-sess2"}
+        )
+        assert resp.status_code == 200
+        engine.snapshot_kv_cache.assert_called_once_with(None, "snap-sess2")
+
+    def test_snapshot_empty_string_request_id_treated_as_session(self, client, engine):
+        """Empty string is normalized to None — both mean session mode."""
+        engine.snapshot_kv_cache.return_value = {
+            "snapshot_id": "snap-sess3",
+            "mode": "session",
+            "num_blocks": 0,
+            "tier": "warm",
+            "latency_ms": 1.0,
+        }
+        resp = client.post("/kv/snapshot", json={"request_id": ""})
+        assert resp.status_code == 200
+        engine.snapshot_kv_cache.assert_called_once_with(None, None)
 
     def test_snapshot_not_found(self, client, engine):
         engine.snapshot_kv_cache.side_effect = ValueError("request not found")

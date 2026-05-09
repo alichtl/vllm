@@ -122,6 +122,22 @@ class BlockHashToBlockMap:
     def __len__(self) -> int:
         return len(self._cache)
 
+    def iter_blocks(self) -> Iterable[tuple[BlockHashWithGroupId, KVCacheBlock]]:
+        """Yield every (hash, block) pair currently held by the cache.
+
+        Handles both the common single-block-per-hash case and the rarer
+        dict-of-blocks case (when multiple cached blocks share the same hash;
+        see NOTE #1 on this class).
+        """
+        for key, blocks in self._cache.items():
+            if isinstance(blocks, KVCacheBlock):
+                yield key, blocks
+            elif isinstance(blocks, dict):
+                for block in blocks.values():
+                    yield key, block
+            else:
+                self._unexpected_blocks_type(blocks)
+
     def _unexpected_blocks_type(self, blocks: Any) -> None:
         raise AssertionError(f"Invalid KV cache block type {type(blocks)}")
 

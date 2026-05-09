@@ -149,9 +149,16 @@ class EngineClient(ABC):
 
     @abstractmethod
     async def snapshot_kv_cache(
-        self, request_id: str, snapshot_id: str | None = None
+        self,
+        request_id: str | None = None,
+        snapshot_id: str | None = None,
     ) -> dict:
-        """Snapshot the KV cache for a request."""
+        """Snapshot KV cache state.
+
+        With ``request_id``, snapshots that one in-flight request's blocks.
+        Without (``request_id is None``), snapshots the entire prefix cache
+        — the unit of swap for multi-tenant turn-based deployments.
+        """
         ...
 
     @abstractmethod

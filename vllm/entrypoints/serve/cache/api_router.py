@@ -109,7 +109,9 @@ async def reset_encoder_cache(raw_request: Request):
 
 
 class SnapshotRequest(BaseModel):
-    request_id: str
+    """Snapshot a request's blocks (when ``request_id`` is given) or the
+    entire prefix cache (when omitted / null / empty)."""
+    request_id: str | None = None
     snapshot_id: str | None = None
 
 
@@ -128,9 +130,11 @@ async def snapshot_kv_cache(body: SnapshotRequest, raw_request: Request):
     rejection = _reject_prefix(body.snapshot_id, config.allowed_id_prefixes)
     if rejection is not None:
         return rejection
+    # Treat empty string the same as omitted — both mean session mode.
+    request_id = body.request_id or None
     try:
         result = await engine_client(raw_request).snapshot_kv_cache(
-            body.request_id, body.snapshot_id
+            request_id, body.snapshot_id
         )
         return JSONResponse(content=result)
     except ValueError as exc:

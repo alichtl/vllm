@@ -633,13 +633,26 @@ class EngineCore:
         return self._snapshot_store
 
     def snapshot_kv_cache(
-        self, request_id: str, snapshot_id: str | None = None
+        self,
+        request_id: str | None = None,
+        snapshot_id: str | None = None,
     ) -> dict:
-        """Snapshot the KV cache of an in-flight request to the store.
+        """Snapshot KV cache state to the store.
 
-        Reads each allocated block from every TP rank, concatenates the
-        rank-local KV-head slices along the kv_heads dim, and saves the
-        full-head tensor under ``snapshot_id``. The request is left untouched.
+        Two modes:
+
+        - **Per-request** (``request_id`` supplied): captures every block
+          allocated to that one in-flight request, including the partial
+          trailing block.
+        - **Session / whole-prefix-cache** (``request_id is None``):
+          captures every block currently held in the prefix cache. This
+          is the unit of swap for the multi-tenant turn-based design —
+          freezes a tenant's full session state in one call.
+
+        In both modes, reads each captured block from every TP rank,
+        concatenates rank-local KV-head slices along the kv_heads dim,
+        and saves the full-head tensor under ``snapshot_id``. Live
+        requests are left untouched.
         """
         store = self._ensure_snapshot_store()
         if store is None:
@@ -650,26 +663,45 @@ class EngineCore:
 
         started = time.time()
 
-        request = self.scheduler.requests.get(request_id)
-        if request is None:
-            raise ValueError(
-                f"request {request_id!r} not found in scheduler"
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        request = None
+        if request_id is None:
+            # Whole-prefix-cache mode: every cached (full + hashed) block.
+            cached_pairs = list(
+                block_pool.cached_block_hash_to_block.iter_blocks()
             )
+            if not cached_pairs:
+                raise RuntimeError(
+                    "prefix cache is empty; nothing to snapshot"
+                )
+            block_ids = [block.block_id for _, block in cached_pairs]
+            block_hashes_local: dict[int, bytes | None] = {
+                block.block_id: hash_ for hash_, block in cached_pairs
+            }
+        else:
+            request = self.scheduler.requests.get(request_id)
+            if request is None:
+                raise ValueError(
+                    f"request {request_id!r} not found in scheduler"
+                )
 
-        request_blocks = self.scheduler.kv_cache_manager.get_blocks(
-            request_id
-        )
-        if len(request_blocks.blocks) != 1:
-            raise RuntimeError(
-                "KV snapshot only supports single-group KV caches; got "
-                f"{len(request_blocks.blocks)} groups"
+            request_blocks = self.scheduler.kv_cache_manager.get_blocks(
+                request_id
             )
-        group_blocks = list(request_blocks.blocks[0])
-        if not group_blocks:
-            raise RuntimeError(
-                f"request {request_id!r} has no allocated KV blocks"
-            )
-        block_ids = [b.block_id for b in group_blocks]
+            if len(request_blocks.blocks) != 1:
+                raise RuntimeError(
+                    "KV snapshot only supports single-group KV caches; got "
+                    f"{len(request_blocks.blocks)} groups"
+                )
+            group_blocks = list(request_blocks.blocks[0])
+            if not group_blocks:
+                raise RuntimeError(
+                    f"request {request_id!r} has no allocated KV blocks"
+                )
+            block_ids = [b.block_id for b in group_blocks]
+            block_hashes_local = {
+                b.block_id: b.block_hash for b in group_blocks
+            }
 
         # Each rank returns dict[block_id, Tensor] with shape
         # [2, num_layers, block_size, num_kv_heads_local, head_size].
@@ -700,24 +732,26 @@ class EngineCore:
 
             snapshot_id = f"snap-{uuid4().hex[:12]}"
 
-        # Capture each block's prefix-cache hash so a future restore can
-        # re-register them in the prefix cache. Non-full blocks have
-        # block_hash=None — these still get snapshotted but won't be
-        # discoverable by hash on restore (only the request that wrote
-        # them could match the partial-block content).
-        block_hashes: dict[int, bytes | None] = {
-            b.block_id: b.block_hash for b in group_blocks
-        }
+        # Per-request: num_tokens comes from the request. Session: every
+        # captured block is a full hashed block in the prefix cache, so
+        # num_tokens = num_blocks * block_size and request_id is "" to
+        # signal "not associated with a single request".
+        if request is not None:
+            num_tokens = request.num_tokens
+            metadata_request_id = request_id
+        else:
+            num_tokens = len(block_ids) * spec.block_size
+            metadata_request_id = ""
 
         from vllm.v1.core.kv_cache_manager import create_snapshot_from_blocks
 
         snapshot = create_snapshot_from_blocks(
             snapshot_id=snapshot_id,
-            request_id=request_id,
+            request_id=metadata_request_id,
             block_ids=block_ids,
             block_data=block_data,
-            block_hashes=block_hashes,
-            num_tokens=request.num_tokens,
+            block_hashes=block_hashes_local,
+            num_tokens=num_tokens,
             block_size=spec.block_size,
             dtype=spec.dtype,
             num_kv_heads=num_kv_heads_total,
@@ -730,7 +764,8 @@ class EngineCore:
         status = store.status(snapshot_id) or {}
         return {
             "snapshot_id": snapshot_id,
-            "request_id": request_id,
+            "request_id": metadata_request_id,
+            "mode": "session" if request is None else "request",
             "num_blocks": snapshot.metadata.num_blocks,
             "num_tokens": snapshot.metadata.num_tokens,
             "size_bytes": snapshot.metadata.estimated_size_bytes,
