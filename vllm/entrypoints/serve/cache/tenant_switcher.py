@@ -163,9 +163,17 @@ class TenantSwitcher:
                     result.get("num_blocks"),
                     old_id,
                 )
-            except RuntimeError as exc:
+            except Exception as exc:
                 # "prefix cache is empty; nothing to snapshot" is fine —
-                # the outgoing tenant just had no cached state.
+                # the outgoing tenant just had no cached state. We catch
+                # the broad Exception (not just RuntimeError) because the
+                # engine RPC layer wraps the original exception type into
+                # its own (e.g. EngineDeadError / generic InternalError),
+                # and the message is the only stable way to detect the
+                # benign empty-cache case across the wrap boundary. Any
+                # other failure logs as a warning and the swap continues
+                # — losing snapshot continuity is preferable to blocking
+                # the incoming tenant's request.
                 if "empty" not in str(exc):
                     logger.warning(
                         "[tenant-swap] snapshot of %s failed: %s",
