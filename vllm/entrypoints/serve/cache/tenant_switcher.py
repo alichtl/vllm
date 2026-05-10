@@ -265,11 +265,13 @@ def install_tenant_switcher(
     ``gated_paths``. Requests missing the header are rejected with 400.
     Requests on non-gated paths bypass the switcher entirely.
     """
+    from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+
     switcher = TenantSwitcher(engine_client)
     app.state.tenant_switcher = switcher
     gated_set = set(gated_paths)
 
-    @app.middleware("http")
     async def _tenant_swap_middleware(request, call_next):
         path = request.url.path
         if path not in gated_set:
@@ -289,5 +291,23 @@ def install_tenant_switcher(
 
         async with switcher.for_tenant(tenant_id):
             return await call_next(request)
+
+    # FastAPI 0.116+/Starlette 0.40+ raise on add_middleware once the
+    # ASGI middleware stack has been built. The build happens lazily on
+    # first request, but install_tenant_switcher runs after init_app_state
+    # has already touched the app in ways that materialize the stack on
+    # current versions. Install via the user_middleware list directly and
+    # invalidate the cached stack so it gets rebuilt on first call —
+    # functionally equivalent to the @app.middleware("http") decorator
+    # but doesn't trip the post-start guard.
+    #
+    # insert(0, ...) puts this middleware at the head of the user list,
+    # which makes it the OUTERMOST wrapper at request time — what we want
+    # so the swap completes before any of the stock middleware (CORS,
+    # exception handlers, request logging) sees the request.
+    app.user_middleware.insert(
+        0, Middleware(BaseHTTPMiddleware, dispatch=_tenant_swap_middleware)
+    )
+    app.middleware_stack = None
 
     return switcher
